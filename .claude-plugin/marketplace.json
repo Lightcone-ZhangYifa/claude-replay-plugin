@@ -1,0 +1,18 @@
+{
+  "name": "claude-replay-plugin",
+  "owner": {
+    "name": "Lightcone-ZhangYifa",
+    "url": "https://github.com/Lightcone-ZhangYifa"
+  },
+  "plugins": [
+    {
+      "name": "claude-replay",
+      "source": "./",
+      "description": "Reconstruct lost git commits from Claude Code session history. Byte-perfect replay of every Edit/Write/Bash op into a clean, semantic commit chain.",
+      "version": "0.1.0",
+      "category": "git",
+      "tags": ["git", "history", "recovery", "audit", "session"],
+      "strict": false
+    }
+  ]
+}
