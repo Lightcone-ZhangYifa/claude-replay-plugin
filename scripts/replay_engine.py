@@ -298,15 +298,18 @@ def _run_bash(cmd: str, sandbox: Path, real_repo: Path, timeout: int = 30) -> in
 
 
 def replay(ops: list[Op], commits_plan: list["CommitSpec"],
-            real_repo: Path, sandbox: Path) -> ReplayResult:
+            real_repo: Path, sandbox: Path, verbose: bool = False) -> ReplayResult:
     op_idx = 0
     edit_failures = 0
     bash_nonzero = 0
     committed: list[tuple[str, str, str]] = []
     repo_str = str(real_repo.resolve())
     sandbox_str = str(sandbox.resolve())
+    total_commits = len(commits_plan)
 
-    for spec in commits_plan:
+    for ci, spec in enumerate(commits_plan, 1):
+        if verbose:
+            print(f"  [{ci:2d}/{total_commits}] {spec.subject}", file=sys.stderr)
         while op_idx < len(ops) and (spec.until_ts == "9999" or ops[op_idx].ts < spec.until_ts):
             op = ops[op_idx]
             try:
@@ -486,6 +489,179 @@ def apply_chain_to_real_repo(real_repo: Path, sandbox: Path, branch: str,
 # CLI
 # --------------------------------------------------------------------------- #
 
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Emit a structured event log of every tool use Claude made.
+
+    For AI-agent behavior researchers — a ready-to-pipe stream of normalized
+    records suitable for jq/pandas/duckdb downstream analysis.
+    """
+    repo = Path(args.repo).resolve()
+    session_dir = project_session_dir(repo)
+    jsonls = find_session_jsonls(session_dir)
+    if not jsonls:
+        print("No session JSONLs found.", file=sys.stderr)
+        return 2
+
+    # Re-parse to capture ALL tool uses (not just file-modifying ones).
+    # Send metadata to stderr so stdout stays clean for piping.
+    print(f"# session_dir: {session_dir}", file=sys.stderr)
+    print(f"# jsonls: {len(jsonls)}", file=sys.stderr)
+    print(f"# format: {args.format}", file=sys.stderr)
+
+    records: list[dict] = []
+    tool_uses: dict[str, dict] = {}
+    tool_results: dict[str, dict] = {}
+    parent_msg: dict[str, str] = {}
+
+    for path in jsonls:
+        sid = path.stem
+        is_subagent = "subagents" in str(path)
+        try:
+            with path.open(encoding="utf-8") as fp:
+                for line_no, line in enumerate(fp):
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = rec.get("timestamp", "")
+                    if args.after and ts < args.after:
+                        continue
+                    if args.before and ts >= args.before:
+                        continue
+                    msg = rec.get("message") or {}
+                    role = msg.get("role")
+                    content = msg.get("content", [])
+                    if isinstance(content, str):
+                        content = [{"type": "text", "text": content}]
+                    if not isinstance(content, list):
+                        continue
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "tool_use" and role == "assistant":
+                            tu_id = block.get("id") or f"{sid}-{line_no}"
+                            tool_uses.setdefault(tu_id, {
+                                "ts": ts, "session_id": sid, "is_subagent": is_subagent,
+                                "tool": block.get("name"),
+                                "input": block.get("input") or {},
+                            })
+                        elif btype == "tool_result" and role == "user":
+                            tu_id = block.get("tool_use_id")
+                            if not tu_id:
+                                continue
+                            rc = block.get("content", "")
+                            if isinstance(rc, list):
+                                rc = "".join(
+                                    x.get("text", "") for x in rc
+                                    if isinstance(x, dict) and x.get("type") == "text"
+                                )
+                            tool_results.setdefault(tu_id, {
+                                "is_error": block.get("is_error", False),
+                                "result_preview": str(rc)[:300],
+                            })
+        except OSError:
+            continue
+
+    # Optional include-tool filter
+    include_tools = set(args.include_tool) if args.include_tool else None
+
+    for tu_id, tu in sorted(tool_uses.items(), key=lambda kv: kv[1]["ts"]):
+        if include_tools and tu["tool"] not in include_tools:
+            continue
+        res = tool_results.get(tu_id, {})
+        rec = {
+            "ts": tu["ts"],
+            "session_id": tu["session_id"],
+            "is_subagent": tu["is_subagent"],
+            "tool": tu["tool"],
+            "tool_use_id": tu_id,
+            "file_path": tu["input"].get("file_path"),
+            "input": tu["input"] if args.full_input else _truncate_input(tu["input"]),
+            "success": not res.get("is_error", False),
+            "result_preview": res.get("result_preview"),
+        }
+        records.append(rec)
+
+    print(f"# records: {len(records)}", file=sys.stderr)
+
+    if args.format == "json":
+        # JSONL: one record per line — most pipe-friendly
+        for r in records:
+            print(json.dumps(r, ensure_ascii=False))
+    elif args.format == "csv":
+        import csv
+        cols = ["ts", "session_id", "is_subagent", "tool", "tool_use_id",
+                "file_path", "success", "input_summary", "result_preview"]
+        w = csv.writer(sys.stdout)
+        w.writerow(cols)
+        for r in records:
+            w.writerow([
+                r["ts"], r["session_id"], r["is_subagent"], r["tool"], r["tool_use_id"],
+                r.get("file_path") or "",
+                r["success"],
+                _input_summary(r["input"]),
+                (r.get("result_preview") or "").replace("\n", " ")[:200],
+            ])
+    elif args.format == "stats":
+        _print_stats(records)
+    else:
+        raise ValueError(f"unknown format: {args.format}")
+
+    return 0
+
+
+def _truncate_input(inp: dict, max_len: int = 200) -> dict:
+    """Return a shallow copy with long string fields truncated for compact JSON output."""
+    out = {}
+    for k, v in inp.items():
+        if isinstance(v, str) and len(v) > max_len:
+            out[k] = v[:max_len] + f"...[truncated {len(v)-max_len} chars]"
+        else:
+            out[k] = v
+    return out
+
+
+def _input_summary(inp: dict) -> str:
+    if not inp:
+        return ""
+    parts = []
+    for k in ("file_path", "command", "description"):
+        if k in inp and isinstance(inp[k], str):
+            parts.append(f"{k}={inp[k][:80]}")
+    return " ".join(parts)[:200]
+
+
+def _print_stats(records: list[dict]) -> None:
+    """Human-readable statistics summary on stdout."""
+    by_tool: defaultdict[str, int] = defaultdict(int)
+    by_tool_success: defaultdict[str, int] = defaultdict(int)
+    by_session: defaultdict[str, int] = defaultdict(int)
+    by_subagent: defaultdict[str, int] = defaultdict(int)
+    file_touches: defaultdict[str, int] = defaultdict(int)
+    for r in records:
+        by_tool[r["tool"]] += 1
+        if r["success"]:
+            by_tool_success[r["tool"]] += 1
+        by_session[r["session_id"]] += 1
+        by_subagent["subagent" if r["is_subagent"] else "main"] += 1
+        if r.get("file_path"):
+            file_touches[r["file_path"]] += 1
+
+    print(f"Total events: {len(records)}")
+    print(f"\nBy session ({len(by_session)} sessions):")
+    for sid, n in sorted(by_session.items(), key=lambda kv: -kv[1])[:10]:
+        print(f"  {n:6d}  {sid[:40]}")
+    print(f"\nBy origin: main={by_subagent['main']}  subagent={by_subagent['subagent']}")
+    print(f"\nBy tool:")
+    for tool, n in sorted(by_tool.items(), key=lambda kv: -kv[1]):
+        ok = by_tool_success[tool]
+        print(f"  {n:6d}  {tool:18s}  success={ok} ({100*ok/n:5.1f}%)")
+    print(f"\nTop 10 hottest files:")
+    for fp, n in sorted(file_touches.items(), key=lambda kv: -kv[1])[:10]:
+        print(f"  {n:4d}  {fp}")
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     session_dir = project_session_dir(repo)
@@ -552,7 +728,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
     sandbox = make_sandbox(repo, baseline, "claude-replay", sandbox_dir)
     print(f"Sandbox: {sandbox}")
 
-    result = replay(ops, specs, repo, sandbox)
+    result = replay(ops, specs, repo, sandbox, verbose=args.verbose)
     print(f"\nCommits created: {len(result.commits)}")
     print(f"Edit/MultiEdit fall-throughs: {result.edit_failures}")
     print(f"Bash non-zero exits: {result.bash_nonzero}")
@@ -657,10 +833,24 @@ def main(argv: Optional[list[str]] = None) -> int:
                          help="allow --apply even when sandbox diverges from working tree")
     p_exec.add_argument("--yes", "-y", action="store_true",
                          help="skip interactive confirmation for --apply")
+    p_exec.add_argument("--verbose", "-v", action="store_true",
+                         help="print per-commit progress to stderr")
+
+    p_analyze = sub.add_parser("analyze", parents=[common],
+                                 help="emit structured event log of every tool use")
+    p_analyze.add_argument("--format", default="json",
+                            choices=["json", "csv", "stats"],
+                            help="output format (default: json = JSONL on stdout)")
+    p_analyze.add_argument("--include-tool", action="append", default=None,
+                            help="restrict to these tools (e.g. --include-tool Edit "
+                                 "--include-tool Bash). Default: all tools.")
+    p_analyze.add_argument("--full-input", action="store_true",
+                            help="emit complete tool inputs (default: truncate strings >200 chars)")
 
     p_status.set_defaults(func=cmd_status)
     p_plan.set_defaults(func=cmd_plan)
     p_exec.set_defaults(func=cmd_execute)
+    p_analyze.set_defaults(func=cmd_analyze)
 
     args = p.parse_args(argv)
     return args.func(args)

@@ -1,0 +1,74 @@
+$ /replay-status
+Project: /home/me/myrepo
+Session dir: /home/me/.claude/projects/-home-me-myrepo
+Session JSONLs: 103 (6 main + 97 subagent)
+File ops in scope: 1274  (Write: 312, Edit: 731, MultiEdit: 9, Bash: 222)
+User messages: 8822
+
+$ /replay-plan
+Strategy: doc-files
+Boundaries: 20
+
+    1. [  94 ops,  33 files]  chore(replay): ssh-architecture-audit-2026-05-04
+    2. [  18 ops,   7 files]  chore(replay): volume-keys-configurable-2026-05-05
+    3. [  30 ops,  10 files]  chore(replay): sessions-tab-ux-fix-2026-05-05
+    4. [  20 ops,   8 files]  chore(replay): connection-trigger-abstraction-2026-05-05
+    5. [  69 ops,  37 files]  chore(replay): settings-registry-2026-05-05
+    6. [  70 ops,  42 files]  chore(replay): appearance-redesign-2026-05-05
+    7. [   9 ops,   6 files]  chore(replay): design-system
+    8. [  30 ops,  19 files]  chore(replay): design-rules-2026-05-05
+    9. [ 143 ops,  49 files]  chore(replay): debug-logging-system-2026-05-05
+   10. [  14 ops,   8 files]  chore(replay): debugging-playbook
+   11. [  22 ops,   7 files]  chore(replay): layout-spacing-fix-2026-05-06
+   12. [  10 ops,   7 files]  chore(replay): retry-countdown-unification-2026-05-06
+   13. [   8 ops,   5 files]  chore(replay): swipe-actions-unification-2026-05-06
+   14. [   1 ops,   1 files]  chore(replay): scattered-controls-audit-2026-05-06
+   15. [  16 ops,  10 files]  chore(replay): scattered-components-unification-2026-05-06
+   16. [  25 ops,  12 files]  chore(replay): floating-button-unification-2026-05-06
+   17. [  31 ops,  10 files]  chore(replay): resize-orchestrator-2026-05-06
+   18. [   3 ops,   3 files]  chore(replay): swipe-actions-fix-v2-2026-05-06
+   19. [  13 ops,   9 files]  chore(replay): resize-orchestrator-v2-2026-05-06
+   20. [  37 ops,   7 files]  chore(replay): fab-bubble-fix-2026-05-06
+
+$ /replay-execute
+Baseline: 70e2cd2
+Boundaries: 20  Total ops: 1274
+Sandbox: /tmp/claude-replay-abc123
+
+Commits created: 20
+Edit/MultiEdit fall-throughs: 0
+Bash non-zero exits: 29
+Diff vs working tree (entries): 0
+
+$ /replay-execute --apply --yes
+Real repo HEAD now: 1205576a8d12
+Backup tag: claude-replay-backup-1730912345
+
+$ git log --oneline 70e2cd2..HEAD
+1205576 chore: align with current working tree (post-replay cleanup)
+0c15efe fix(editor): FAB bubble VSCode-style Find + dynamic content sizing
+15f4d26 fix: SessionResizeBus v2 — visibility-driven yield
+3e4defa fix: AppSwipeActions v2 — clip + height-aware              ← regret
+55f5fe7 refactor: SessionResizeBus v1
+71ae775 refactor: AppFab/AppFabBubble + EditorFabCluster
+079c3ef refactor: extract AppCard/AppCrashRecoveryDialog/AppMultiSelect*
+7a5d67c docs: scattered-controls audit
+ac01f76 refactor: AppSwipeActions v1 — shared swipe→action panel    ← keep
+31b9073 refactor: unified RetryCountdown component
+278c770 fix: AppScaffold canonical content padding
+28d62ff docs: debugging playbook + AppLogger polish
+b649d34 feat: AppLogger framework + DebugLogScreen + DebugBundle
+d8b1f8e feat: design-rules grep gates wired into gradle
+a0fb007 docs: design-system spec
+38be5b5 feat: design tokens + App component library
+2b317c4 refactor: declarative settings registry
+52877bb refactor: extract ConnectionTrigger sealed type
+5d5b092 fix: sessions-tab UX rework
+75a47b6 feat: configurable volume-key behavior
+271bd57 refactor(ssh): cleanup + server YAML migration per audit
+
+$ git revert 3e4defa
+[main 9a4b7c2] Revert "fix: AppSwipeActions v2 — clip + height-aware"
+
+# v1 (ac01f76) is intact. v2 (3e4defa) is reverted. Days of work, recovered
+# in 23 seconds, with surgical control over what to keep.
