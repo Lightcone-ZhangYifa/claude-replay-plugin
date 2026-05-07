@@ -38,7 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -49,11 +49,77 @@ from typing import Iterable, Optional
 # Session discovery
 # --------------------------------------------------------------------------- #
 
+CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+
+
 def project_session_dir(cwd: Path | str | None = None) -> Path:
-    """Resolve ~/.claude/projects/-{encoded-cwd}/ for the given project root."""
-    cwd = Path(cwd or os.getcwd()).resolve()
-    encoded = "-" + str(cwd).lstrip("/").replace("/", "-")
-    return Path.home() / ".claude" / "projects" / encoded
+    """Locate ~/.claude/projects/<dir>/ for the given project root.
+
+    Robust lookup: scan all session dirs and pick the one whose JSONL records
+    have a matching `cwd` field. This is the only authoritative source — the
+    directory name is just an opaque encoding chosen by Claude Code, not our
+    contract. Falls back to the encoded form if no JSONL match is found
+    (covers the case where the dir exists but JSONLs haven't been written yet).
+    """
+    target = str(Path(cwd or os.getcwd()).resolve())
+    if CLAUDE_PROJECTS_ROOT.exists():
+        for d in CLAUDE_PROJECTS_ROOT.iterdir():
+            if not d.is_dir():
+                continue
+            recorded = _read_cwd(d)
+            if recorded and recorded == target:
+                return d
+    # Fallback: Claude Code's apparent encoding (slashes -> dashes, leading dash).
+    # Used only when the cwd-based lookup found nothing.
+    encoded = "-" + target.lstrip("/").replace("/", "-")
+    return CLAUDE_PROJECTS_ROOT / encoded
+
+
+def _read_cwd(session_dir: Path) -> Optional[str]:
+    """Read the `cwd` field from the first JSONL record in session_dir.
+
+    Returns None if no JSONL exists or cwd is missing. Intended as a cheap
+    one-line probe for project-root discovery — not a full timeline scan.
+    """
+    for jp in session_dir.glob("*.jsonl"):
+        try:
+            with jp.open(encoding="utf-8") as fp:
+                first = fp.readline()
+            rec = json.loads(first)
+            cwd = rec.get("cwd")
+            if cwd:
+                return cwd
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        break
+    return None
+
+
+def list_available_projects() -> list[dict]:
+    """Enumerate all session dirs under ~/.claude/projects/ with their recorded
+    `cwd`, JSONL count, and last-modified time. Used for diagnostic listings
+    when the user hasn't specified which project to operate on.
+    """
+    out: list[dict] = []
+    if not CLAUDE_PROJECTS_ROOT.exists():
+        return out
+    for d in CLAUDE_PROJECTS_ROOT.iterdir():
+        if not d.is_dir():
+            continue
+        cwd = _read_cwd(d)
+        jsonls = list(d.rglob("*.jsonl"))
+        if not jsonls:
+            continue
+        last_modified = max((j.stat().st_mtime for j in jsonls), default=0)
+        out.append({
+            "session_dir": d,
+            "name": d.name,
+            "cwd": cwd,
+            "jsonl_count": len(jsonls),
+            "last_modified": last_modified,
+        })
+    out.sort(key=lambda x: -x["last_modified"])
+    return out
 
 
 def find_session_jsonls(session_dir: Path) -> list[Path]:
@@ -759,47 +825,40 @@ def cmd_recover_project(args: argparse.Namespace) -> int:
         print(f"ERROR: {out} already exists; pass --force to overwrite", file=sys.stderr)
         return 2
 
-    # Discover sessions for the original project
-    if args.project_name:
-        session_dir = Path.home() / ".claude" / "projects" / args.project_name
-    elif args.session_dir:
+    # Discover the session dir for the project to recover.
+    if args.session_dir:
         session_dir = Path(args.session_dir)
-    else:
-        # Try auto: derive from out's name (assume user names the recovery dir
-        # similarly to the original project, common pattern)
-        candidates = [
-            Path.home() / ".claude" / "projects" / f"-{out.name}",
-        ]
-        for d in (Path.home() / ".claude" / "projects").iterdir() if (Path.home() / ".claude" / "projects").exists() else []:
-            if d.is_dir() and out.name in d.name:
-                candidates.append(d)
-        session_dir = next((c for c in candidates if c.exists()), None)
-        if not session_dir:
-            print(f"ERROR: cannot auto-discover session dir; pass --project-name or --session-dir",
+    elif args.project_name:
+        session_dir = CLAUDE_PROJECTS_ROOT / args.project_name
+    elif args.original_root:
+        # Look up by recorded cwd
+        session_dir = project_session_dir(args.original_root)
+        if not session_dir.exists():
+            print(f"ERROR: no session found with cwd={args.original_root}",
                   file=sys.stderr)
-            print(f"Available projects:", file=sys.stderr)
-            root = Path.home() / ".claude" / "projects"
-            if root.exists():
-                for d in sorted(root.iterdir()):
-                    print(f"  {d.name}", file=sys.stderr)
+            _print_available_projects(file=sys.stderr)
             return 2
+    else:
+        print("ERROR: pass one of --session-dir / --project-name / --original-root",
+              file=sys.stderr)
+        _print_available_projects(file=sys.stderr)
+        return 2
 
     print(f"Session dir: {session_dir}")
     jsonls = find_session_jsonls(session_dir)
     if not jsonls:
         print(f"ERROR: no JSONLs in {session_dir}", file=sys.stderr)
+        _print_available_projects(file=sys.stderr)
         return 2
 
-    # Determine the original project root from the first file_path we see
-    original_root = args.original_root
+    # The project root is recorded by Claude Code in every session record's `cwd`
+    # field. We just read it. User can override via --original-root.
+    original_root = (args.original_root or _infer_original_root(jsonls) or "").rstrip("/")
     if not original_root:
-        original_root = _infer_original_root(jsonls)
-        if not original_root:
-            print("ERROR: cannot infer original project root; pass --original-root /home/.../proj",
-                  file=sys.stderr)
-            return 2
-    original_root = original_root.rstrip("/")
-    print(f"Original project root (inferred): {original_root}")
+        print("ERROR: no `cwd` field in this session's JSONL records; pass "
+              "--original-root <absolute-path> manually.", file=sys.stderr)
+        return 2
+    print(f"Original project root (from cwd field): {original_root}")
 
     # Gather all ops on files under original_root (dedup tool_use ids across compaction continuations)
     ops_per_file: dict[str, list[Op]] = defaultdict(list)
@@ -918,16 +977,36 @@ def cmd_recover_project(args: argparse.Namespace) -> int:
     return 0
 
 
-def _infer_original_root(jsonls: list[Path]) -> Optional[str]:
-    """Find the most-common project root among file_paths in the JSONLs.
+def _print_available_projects(file=sys.stderr) -> None:
+    """List session dirs with the cwd Claude Code recorded for each."""
+    projects = list_available_projects()
+    if not projects:
+        print(f"  (no sessions found under {CLAUDE_PROJECTS_ROOT})", file=file)
+        return
+    print(f"\nAvailable sessions under {CLAUDE_PROJECTS_ROOT}:", file=file)
+    print(f"  {'cwd (project root)':50s}  {'jsonls':>7s}  {'last touched':19s}  session-name",
+          file=file)
+    for p in projects:
+        from datetime import datetime
+        ts = datetime.fromtimestamp(p["last_modified"]).strftime("%Y-%m-%d %H:%M:%S")
+        cwd = p["cwd"] or "<unknown>"
+        print(f"  {cwd[:50]:50s}  {p['jsonl_count']:>7d}  {ts:19s}  {p['name']}",
+              file=file)
+    print("\nPass --original-root <cwd>  OR  --session-dir <session-name>  OR  "
+          "--project-name <session-name>", file=file)
 
-    Sample broadly across all sessions, then pick the depth-2 prefix
-    (e.g. /home/<user>/<project>) that appears most often. This handles
-    the common case where memory/cache files live under a different
-    prefix than the actual project.
+
+def _infer_original_root(jsonls: list[Path]) -> Optional[str]:
+    """Read the `cwd` field from the JSONL records and return it.
+
+    Each Claude Code session record carries the project root as `cwd`. This
+    is authoritative — there's no need to heuristically guess from file paths,
+    no depth assumption, no OS assumption. If a session's cwd changed mid-run
+    (rare), the most-common value wins.
+
+    Returns None if no JSONLs carry a `cwd` field.
     """
-    from collections import Counter
-    prefixes: Counter[str] = Counter()
+    cwds: Counter[str] = Counter()
     for jp in jsonls:
         try:
             with jp.open(encoding="utf-8") as fp:
@@ -936,32 +1015,14 @@ def _infer_original_root(jsonls: list[Path]) -> Optional[str]:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    msg = rec.get("message") or {}
-                    if msg.get("role") != "assistant":
-                        continue
-                    content = msg.get("content", [])
-                    if not isinstance(content, list):
-                        continue
-                    for block in content:
-                        if not isinstance(block, dict) or block.get("type") != "tool_use":
-                            continue
-                        if block.get("name") not in ("Write", "Edit", "MultiEdit"):
-                            continue
-                        fp_ = (block.get("input") or {}).get("file_path", "")
-                        if not fp_.startswith("/"):
-                            continue
-                        # Take depth-3 prefix: /home/<user>/<project>
-                        parts = fp_.split("/")
-                        if len(parts) >= 4:
-                            prefix = "/".join(parts[:4])
-                            prefixes[prefix] += 1
+                    cwd = rec.get("cwd")
+                    if cwd and isinstance(cwd, str):
+                        cwds[cwd] += 1
         except OSError:
             continue
-    if not prefixes:
+    if not cwds:
         return None
-    # Return the prefix with the most file ops
-    most_common, _ = prefixes.most_common(1)[0]
-    return most_common
+    return cwds.most_common(1)[0][0]
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:

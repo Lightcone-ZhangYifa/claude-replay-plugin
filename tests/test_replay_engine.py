@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest.mock
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -311,6 +312,86 @@ def _collect_ops_for_path(jsonls, target_path: str):
     for op in _collect_all_ops(jsonls):
         if op.file_path == target_path:
             yield op
+
+
+def test_infer_original_root_from_cwd_field_no_depth_assumption():
+    """Project root is read from the `cwd` field in JSONL records.
+
+    Crucially, this works for ANY absolute path — no /home/<user>/<project>
+    depth assumption. Test with /opt/work/x AND /srv/repos/long/path/proj/y.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td).resolve()
+        # Synthetic session for an unusual project path
+        for cwd in ["/opt/work/x", "/srv/cluster/svc-foo/repo",
+                     "/Users/you/Documents/Project Bar/v2"]:
+            session_dir = tmp / "sessions"
+            if session_dir.exists():
+                shutil.rmtree(session_dir)
+            session_dir.mkdir(parents=True)
+            records = [
+                # The cwd field — that's the authoritative source
+                {"timestamp": _ts(0), "cwd": cwd, "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "u1", "name": "Write",
+                                  "input": {"file_path": f"{cwd}/main.py", "content": ""}}],
+                }},
+                _tool_result("u1", _ts(1)),
+            ]
+            _make_jsonl(session_dir, "main", records)
+
+            jsonls = re_.find_session_jsonls(session_dir)
+            inferred = re_._infer_original_root(jsonls)
+            assert inferred == cwd, (
+                f"_infer_original_root({cwd!r}) returned {inferred!r}; "
+                "expected exact match because it should READ the cwd field, "
+                "not heuristically guess from path depth."
+            )
+
+
+def test_infer_returns_none_when_no_cwd_field():
+    """Graceful degradation when records have no cwd field — return None
+    instead of crashing or returning a wrong heuristic guess."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td).resolve()
+        session_dir = tmp / "sessions"
+        records = [
+            # No cwd in this record at all
+            {"timestamp": _ts(0), "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "u1", "name": "Write",
+                              "input": {"file_path": "/x/y/foo.py", "content": ""}}],
+            }},
+        ]
+        _make_jsonl(session_dir, "main", records)
+        jsonls = re_.find_session_jsonls(session_dir)
+        assert re_._infer_original_root(jsonls) is None
+
+
+def test_project_session_dir_matches_by_cwd_field_not_encoding():
+    """project_session_dir should match by the cwd field, not the dir name encoding.
+
+    Edge case: a project at /a/b-c/d gets encoded to '-a-b-c-d' which is
+    ambiguous with /a/b/c/d's encoding. Lookup should disambiguate by reading
+    cwd from the JSONL.
+    """
+    import unittest.mock
+    with tempfile.TemporaryDirectory() as td:
+        fake_root = Path(td).resolve() / "projects"
+        fake_root.mkdir()
+        # Two encoded dirs with the SAME naive-decoded form '-a-b-c-d'
+        for name, cwd in [("-a-b-c-d", "/a/b/c/d"),
+                            ("-a-b-c-d-alt", "/a/b-c/d")]:
+            sd = fake_root / name
+            sd.mkdir()
+            records = [{
+                "timestamp": _ts(0), "cwd": cwd,
+                "message": {"role": "assistant", "content": []},
+            }]
+            _make_jsonl(sd, "main", records)
+        with unittest.mock.patch.object(re_, "CLAUDE_PROJECTS_ROOT", fake_root):
+            assert re_.project_session_dir("/a/b/c/d").name == "-a-b-c-d"
+            assert re_.project_session_dir("/a/b-c/d").name == "-a-b-c-d-alt"
 
 
 def _collect_all_ops(jsonls):

@@ -17,7 +17,7 @@ Claude Code persists a complete record of every assistant turn — including eve
   └── ...
 ```
 
-The encoded-cwd is your project root with `/` replaced by `-` and a leading `-`. So `/home/me/myrepo` becomes `-home-me-myrepo`.
+The directory name under `~/.claude/projects/` is an opaque encoding chosen by Claude Code (currently: leading `-` plus the absolute cwd with `/` replaced by `-`, but this is an implementation detail). **claude-replay never relies on the encoding scheme.** Every JSONL record carries the original project root in a top-level `cwd` field — that's the authoritative source. We scan all session dirs and match by `cwd` field, so projects at any path work: `/home/me/proj`, `/opt/work/repo`, `/Users/foo/Documents/Bar`, `/srv/cluster/svc-x`, etc. No depth assumption, no OS assumption.
 
 Each line of a JSONL is a JSON object representing one message:
 
