@@ -1,0 +1,20 @@
+{
+  "name": "claude-replay",
+  "version": "0.1.0",
+  "description": "Reconstruct lost git commits from Claude Code session history. Byte-perfect replay of every Edit/Write/Bash op, with smart boundary detection — turn a chaotic working tree into a clean, semantic commit chain.",
+  "author": {
+    "name": "Lightcone-ZhangYifa",
+    "url": "https://github.com/Lightcone-ZhangYifa/claude-replay-plugin"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/Lightcone-ZhangYifa/claude-replay-plugin",
+  "repository": "https://github.com/Lightcone-ZhangYifa/claude-replay-plugin",
+  "keywords": [
+    "claude-code",
+    "git",
+    "commit-history",
+    "replay",
+    "session-recovery",
+    "ai-audit-trail"
+  ]
+}
