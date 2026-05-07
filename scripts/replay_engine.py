@@ -192,8 +192,18 @@ def _bash_touches_repo(cmd: str, repo_str: str) -> bool:
     return repo_str in cmd or _looks_like_relative_repo_op(cmd)
 
 
+_REL_REPO_OP_RE = re.compile(
+    r"(?:^|\n|\s|;|&&|\|\|)\s*"
+    r"(?:sed\s+-i|rm\b|mv\b|cp\b|git\s+rm|cat\s*<<|awk\b|for\s+\w+\s+in)"
+)
+
+
 def _looks_like_relative_repo_op(cmd: str) -> bool:
-    return any(s in cmd for s in ("sed -i", " mv ", " rm ", "git rm", "cat <<"))
+    """True if the command starts a file-mod op (rm/mv/sed/cat>/etc.) that
+    would target paths relative to its cwd. We use a word-boundary regex
+    rather than substring checks so 'rm foo' at line start matches just
+    like ' rm foo' mid-line."""
+    return bool(_REL_REPO_OP_RE.search(cmd))
 
 
 # --------------------------------------------------------------------------- #
@@ -346,12 +356,7 @@ def replay(ops: list[Op], commits_plan: list["CommitSpec"],
         ).decode().strip()
         committed.append((sha, spec.subject, spec.body))
 
-    diff = subprocess.run(
-        ["diff", "-r", "--brief"] + [arg for x in DEFAULT_DIFF_EXCLUDES for arg in ("-x", x)] +
-        [str(sandbox), str(real_repo)],
-        capture_output=True, text=True,
-    )
-    diff_lines = [l for l in diff.stdout.split("\n") if l.strip()]
+    diff_lines = _git_aware_diff(sandbox, real_repo)
     return ReplayResult(
         sandbox=sandbox, branch="claude-replay",
         commits=committed, op_count=op_idx,
@@ -366,6 +371,76 @@ DEFAULT_DIFF_EXCLUDES = [
     "node_modules", "target", "dist", ".next", ".kotlin", "__pycache__",
     ".venv", "venv", ".pytest_cache", ".mypy_cache", ".tox", ".tsbuildinfo",
 ]
+
+
+def _git_aware_diff(sandbox: Path, real_repo: Path) -> list[str]:
+    """Diff sandbox vs real_repo restricted to files git tracks (or would track) in real_repo.
+
+    Strategy: enumerate the union of tracked + untracked-not-ignored files in real_repo,
+    then compare each one's bytes against the sandbox. This respects .gitignore and ignores
+    transient build artifacts that diff -r would surface.
+
+    Returns a list of human-readable divergence strings.
+    """
+    try:
+        # Files git considers part of the project (tracked + untracked-but-not-ignored)
+        out = subprocess.check_output(
+            ["git", "-C", str(real_repo), "ls-files", "--cached", "--others", "--exclude-standard"],
+            text=True,
+        )
+        candidate_paths = [p for p in out.splitlines() if p.strip()]
+    except subprocess.CalledProcessError:
+        # Fall back to plain diff -r
+        diff = subprocess.run(
+            ["diff", "-r", "--brief"] + [arg for x in DEFAULT_DIFF_EXCLUDES for arg in ("-x", x)] +
+            [str(sandbox), str(real_repo)],
+            capture_output=True, text=True,
+        )
+        return [l for l in diff.stdout.split("\n") if l.strip()]
+
+    divergent: list[str] = []
+    sandbox_files: set[str] = set()
+    # Enumerate sandbox files too (so we catch sandbox-only files)
+    for path in sandbox.rglob("*"):
+        if path.is_file() and ".git/" not in str(path) and "/build/" not in str(path):
+            try:
+                rel = path.relative_to(sandbox)
+                sandbox_files.add(str(rel))
+            except ValueError:
+                continue
+
+    for rel in candidate_paths:
+        sb = sandbox / rel
+        rp = real_repo / rel
+        if not rp.exists():
+            continue
+        if not sb.exists():
+            divergent.append(f"Only in {real_repo}: {rel}")
+            continue
+        try:
+            if sb.read_bytes() != rp.read_bytes():
+                divergent.append(f"Files differ: {rel}")
+        except (OSError, IsADirectoryError):
+            continue
+        sandbox_files.discard(rel)
+
+    # Anything left in sandbox_files that real_repo would track → sandbox-only divergence
+    for rel in sorted(sandbox_files):
+        rp = real_repo / rel
+        if rp.exists():
+            continue
+        # Don't flag files that would be gitignored anyway
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(real_repo), "check-ignore", "-q", rel],
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                continue  # ignored by gitignore, skip
+        except subprocess.CalledProcessError:
+            pass
+        divergent.append(f"Only in {sandbox}: {rel}")
+    return divergent
 
 
 # --------------------------------------------------------------------------- #
@@ -527,6 +602,7 @@ def cmd_recover_file(args: argparse.Namespace) -> int:
 
     ops_per_file: dict[str, list[Op]] = defaultdict(list)
     found_paths: set[str] = set()
+    seen_tu_ids: set[str] = set()  # dedup across compaction continuations
 
     for sd in session_dirs:
         jsonls = find_session_jsonls(sd)
@@ -534,7 +610,7 @@ def cmd_recover_file(args: argparse.Namespace) -> int:
             sid = path.stem
             try:
                 with path.open(encoding="utf-8") as fp:
-                    for line in fp:
+                    for line_no, line in enumerate(fp):
                         try:
                             rec = json.loads(line)
                         except json.JSONDecodeError:
@@ -554,9 +630,12 @@ def cmd_recover_file(args: argparse.Namespace) -> int:
                             name = block.get("name")
                             if name not in ("Write", "Edit", "MultiEdit"):
                                 continue
+                            tu_id = block.get("id") or f"{sid}-{line_no}"
+                            if tu_id in seen_tu_ids:
+                                continue  # dedup: same tool_use can appear in multiple JSONLs after compaction
+                            seen_tu_ids.add(tu_id)
                             inp = block.get("input") or {}
                             fp_ = inp.get("file_path", "")
-                            # Match by exact path or path-match regex
                             matches = False
                             if target and fp_ == str(target):
                                 matches = True
@@ -722,13 +801,14 @@ def cmd_recover_project(args: argparse.Namespace) -> int:
     original_root = original_root.rstrip("/")
     print(f"Original project root (inferred): {original_root}")
 
-    # Gather all ops on files under original_root
+    # Gather all ops on files under original_root (dedup tool_use ids across compaction continuations)
     ops_per_file: dict[str, list[Op]] = defaultdict(list)
+    seen_tu_ids: set[str] = set()
     for jpath in jsonls:
         sid = jpath.stem
         try:
             with jpath.open(encoding="utf-8") as fp:
-                for line in fp:
+                for line_no, line in enumerate(fp):
                     try:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
@@ -748,6 +828,10 @@ def cmd_recover_project(args: argparse.Namespace) -> int:
                         name = block.get("name")
                         if name not in ("Write", "Edit", "MultiEdit"):
                             continue
+                        tu_id = block.get("id") or f"{sid}-{line_no}"
+                        if tu_id in seen_tu_ids:
+                            continue
+                        seen_tu_ids.add(tu_id)
                         inp = block.get("input") or {}
                         fp_ = inp.get("file_path", "")
                         if not fp_.startswith(original_root + "/"):
@@ -835,9 +919,16 @@ def cmd_recover_project(args: argparse.Namespace) -> int:
 
 
 def _infer_original_root(jsonls: list[Path]) -> Optional[str]:
-    """Find the longest common prefix of file_paths across the sessions."""
-    paths: list[str] = []
-    for jp in jsonls[:5]:  # sample
+    """Find the most-common project root among file_paths in the JSONLs.
+
+    Sample broadly across all sessions, then pick the depth-2 prefix
+    (e.g. /home/<user>/<project>) that appears most often. This handles
+    the common case where memory/cache files live under a different
+    prefix than the actual project.
+    """
+    from collections import Counter
+    prefixes: Counter[str] = Counter()
+    for jp in jsonls:
         try:
             with jp.open(encoding="utf-8") as fp:
                 for line in fp:
@@ -857,20 +948,20 @@ def _infer_original_root(jsonls: list[Path]) -> Optional[str]:
                         if block.get("name") not in ("Write", "Edit", "MultiEdit"):
                             continue
                         fp_ = (block.get("input") or {}).get("file_path", "")
-                        if fp_.startswith("/"):
-                            paths.append(fp_)
-                            if len(paths) > 100:
-                                break
-                    if len(paths) > 100:
-                        break
+                        if not fp_.startswith("/"):
+                            continue
+                        # Take depth-3 prefix: /home/<user>/<project>
+                        parts = fp_.split("/")
+                        if len(parts) >= 4:
+                            prefix = "/".join(parts[:4])
+                            prefixes[prefix] += 1
         except OSError:
             continue
-        if len(paths) > 100:
-            break
-    if not paths:
+    if not prefixes:
         return None
-    common = os.path.commonpath(paths)
-    return common if common.count("/") >= 2 else None
+    # Return the prefix with the most file ops
+    most_common, _ = prefixes.most_common(1)[0]
+    return most_common
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
