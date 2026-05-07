@@ -4,9 +4,9 @@
 
 ### **The undo button you forgot to ask for.**
 
-**You forgot to commit.** Claude Code wrote 165 files across a week of sessions. Your `git status` is a wall of red. You don't remember the order, you can't tell "the v2 fix you regret" from "the v1 you want to keep", and writing 20 commits by hand from a snapshot is a forensic nightmare.
+`claude-replay` reads the raw session JSONLs that **Claude Code already wrote to disk** and uses them as a deterministic event stream. It can rebuild the git history you forgot to make, recover a single file Claude deleted, resurrect an entire `rm -rf`'d project — even export every tool call as a structured event log for AI-agent research.
 
-**claude-replay reads Claude's own raw session JSONLs and rebuilds the commit history you forgot to make** — byte-for-byte, in order, including every intermediate change Claude made and later overwrote.
+Byte-perfect. Zero dependencies. Works on any language, any project type.
 
 [![CI](https://github.com/Lightcone-ZhangYifa/claude-replay-plugin/actions/workflows/test.yml/badge.svg)](https://github.com/Lightcone-ZhangYifa/claude-replay-plugin/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -18,29 +18,13 @@
 
 ---
 
-## Two reasons this exists
+## Four reasons this exists
 
-### 🚑 1. Rescue mode: you forgot to commit
+### 🚑 1. Rescue mode — you forgot to commit
 
-You weren't sloppy — you were in flow. Claude was building a feature, then iterating, then a sub-agent took a detour, then you context-compacted, then you opened a new session, then another, then suddenly it's been a week and you have:
+`git status` is a wall of red. 165 uncommitted files across a week of sessions. You can't tell "the v2 fix you regret" from "the v1 you want to keep." Hand-writing 20 semantic commits from a snapshot means **inventing** history.
 
-```
-$ git status -s | wc -l
-165
-```
-
-That's the canonical "I forgot to commit" disaster. Hand-writing 20 semantic commits from a final snapshot means **inventing** history — guessing what changed when, in what order, and by which feature. You'll lose the intermediate states. You'll bundle unrelated work. You'll never recover the v1 that v2 overwrote.
-
-You don't have to. **Claude already wrote it down.**
-
-Every assistant turn — every `Edit`, every `Write`, every `Bash` command — was streamed to disk by Claude Code:
-
-```
-~/.claude/projects/-{your-cwd}/*.jsonl
-~/.claude/projects/-{your-cwd}/subagents/*.jsonl
-```
-
-`Write` records the absolute file content. `Edit` records `(old_string, new_string)`. `Bash` records the literal command. **claude-replay reads these JSONLs at the principle level** — as a deterministic event stream — and replays them in timestamp order against the right baseline commit. The result is your real history, not a re-summarization. Including every intermediate version of a file that was later modified again. Nothing fabricated, nothing lost.
+You don't have to. **Claude already wrote it down.** Every Edit, every Write, every Bash command was streamed to `~/.claude/projects/-{cwd}/*.jsonl` (and `subagents/*.jsonl` for sub-agents). Replay them in timestamp order against the right baseline commit and you reproduce the exact byte sequence — including every intermediate state that was later overwritten.
 
 ```
 $ /replay
@@ -50,38 +34,86 @@ $ /replay
 ↳ apply:    real repo HEAD now: 1205576 (previous tagged as backup)
 ```
 
-After: a clean `git log --oneline`. You can `git revert` one feature, `git bisect` to find what broke, or push 20 PRs. Your forgotten week became 20 reviewable commits.
+![rescue mode demo](docs/demos/01-rescue.gif)
 
-### 🔬 2. Research mode: you study AI agent behavior
+After: a clean `git log --oneline`. `git revert` one feature, `git bisect` to find a regression, push 20 PRs. Your forgotten week became 20 reviewable commits.
 
-If you research LLM agents — error recovery, tool-use patterns, multi-step planning, self-correction loops, sub-agent delegation, context management — Claude Code's session JSONLs are an extraordinary corpus, and **claude-replay gives you a structured front-end into it**.
+---
+
+### 🪢 2. Lifeline — Claude (or you) deleted an important file
+
+You ran `rm` in the wrong terminal. Claude refactored a file out of existence "as cleanup". A Bash one-liner went rogue. Whatever the reason, an important file is gone — and you wrote it through Claude.
 
 ```bash
-# Export every tool call as JSON (no replay, no git side effects)
-claude-replay analyze --repo /path/to/agent-experiment --format json > events.json
+$ claude-replay recover-file --file /home/me/repo/important.py --list-versions
+=== /home/me/repo/important.py (10 ops) ===
+  2026-05-07T04:55:22  Write       (content: 28375 bytes)
+  2026-05-07T04:57:11  Write       (content: 26973 bytes)
+  2026-05-07T05:07:59  Edit        (replace 48 chars)
+  ...
 
-# Schema (one record per tool_use):
-# {
-#   "ts": "2026-05-06T15:11:11Z",
-#   "session_id": "ff42acb7-...",
-#   "is_subagent": false,
-#   "tool": "Edit",
-#   "file_path": "/abs/path/foo.py",
-#   "input": {...},               # original tool input verbatim
-#   "success": true,
-#   "result_preview": "..."        # truncated tool result
-# }
+$ claude-replay recover-file --file /home/me/repo/important.py --output-dir /tmp/restored
+RECOVERED /tmp/restored/important.py  (54874 bytes from 10 ops)
 ```
 
-The `analyze` command also surfaces:
+![file recovery demo](docs/demos/02-recover-file.gif)
 
-- **Edit retry patterns** — how often does the agent re-issue an Edit after `old_string not found`?
-- **File hot-spots** — which files are touched most? In what order?
-- **Sub-agent invocations** — when does the parent delegate, and to which subagent type?
-- **Time gaps** — pauses between ops correlate with user-think time vs LLM latency
-- **User intervention shape** — message lengths, approval cadence, correction rate
+Recover the latest version, or **any** historical version with `--at-ts 2026-05-06T14:00:00Z`. Every version Claude ever wrote is reachable.
 
-If you're studying AI agent behavior, the JSONLs are your raw data and `claude-replay analyze` is your tap.
+---
+
+### ⚰️ 3. Back from the dead — your entire project is gone
+
+Worst case: you `rm -rf`'d the project. Or moved a disk and forgot to copy. Or a script ate it. Whatever — the working tree is gone. **But `~/.claude/projects/` is untouched.**
+
+If the project was built primarily through Claude, the JSONLs contain enough to reconstruct the entire file tree:
+
+```bash
+$ claude-replay recover-project \
+    --project-name -home-me-myapp \
+    --output-dir ~/recovered-myapp \
+    --git-init
+Session dir: /home/me/.claude/projects/-home-me-myapp
+Original project root (inferred): /home/me/myapp
+Files with recoverable ops: 174
+Recovered 174 files into ~/recovered-myapp
+Initialized git repo at ~/recovered-myapp with one snapshot commit.
+```
+
+![project recovery demo](docs/demos/03-recover-project.gif)
+
+Then chain into commit-history reconstruction (use case #1):
+
+```bash
+cd ~/recovered-myapp
+claude-replay execute --apply
+```
+
+The result is a fully-recovered project **with semantic commit history**. Information loss limited to: (a) files Claude never touched (typically initial scaffolding or vendored deps), (b) files whose first op was `Edit` rather than `Write` — Claude saw them but never wrote them from scratch.
+
+---
+
+### 🔬 4. Research mode — you study AI agent behavior
+
+Claude Code's session JSONLs capture **months of real human-agent collaboration** on real codebases — including the messy parts: failed edits, sub-agent escalations, context compactions, mid-task pivots, multi-day workflows. `claude-replay analyze` is your structured tap.
+
+```bash
+$ claude-replay analyze --format stats | head -15
+Total events: 2874
+By origin: main=2280  subagent=594
+
+By tool:
+    1124  Bash                success=1119 ( 99.6%)
+     670  Read                success=668 ( 99.7%)
+     585  Edit                success=564 ( 96.4%)
+     206  TaskUpdate          success=206 (100.0%)
+     153  Write               success=143 ( 93.5%)
+      19  Agent               success=19 (100.0%)
+```
+
+![research demo](docs/demos/04-research.gif)
+
+Pipe JSONL into `jq` / `pandas` / `duckdb`. Per-tool failure rates, retry patterns, sub-agent delegation graphs, time-gap distributions — all derivable. See [`docs/researchers.md`](docs/researchers.md) for the full event schema and example analyses.
 
 ---
 
@@ -99,7 +131,6 @@ If you're studying AI agent behavior, the JSONLs are your raw data and `claude-r
 └──────────────────────────────────────┘         │    Edit  → str.replace   │
                                                   │    MultiEdit → seq.     │
                                                   │    Bash  → bash -c      │
-                                                  │           (cwd=sandbox) │
                                                   └──────────┬───────────────┘
                                                              │
                                                              ▼
@@ -119,7 +150,7 @@ If you're studying AI agent behavior, the JSONLs are your raw data and `claude-r
                                                   └──────────────────────────┘
 ```
 
-The mechanism is **principle-level**, not heuristic. Each op was originally applied to a deterministic state; replaying the same op against the same starting state produces the same bytes. We don't infer or summarize — we re-execute the same instructions. **Intermediate states that were later overwritten are preserved as their own commits**, because each commit boundary snapshots the state at that point in the timeline, not the final state.
+Each op was originally applied to a deterministic input state. Replaying it against the same starting state produces the same bytes. We don't infer or summarize — we re-execute. **Intermediate states are preserved as their own commits**, because each commit boundary snapshots the timeline state at that point, not the final state. See [`docs/architecture.md`](docs/architecture.md) for the full mechanism.
 
 ---
 
@@ -132,53 +163,30 @@ The mechanism is **principle-level**, not heuristic. Each op was originally appl
 /plugin install claude-replay@claude-replay-plugin
 ```
 
-Then use `/replay`, `/replay-status`, `/replay-plan`, `/replay-execute` from any Claude Code session.
+Slash commands you'll get:
+- `/replay` — guided end-to-end (status → plan → confirm → build → verify → apply)
+- `/replay-status` — what's in your session JSONLs (read-only)
+- `/replay-plan` — preview the proposed commit chain (read-only)
+- `/replay-execute` — build chain in sandbox, verify byte-equality, optionally `--apply`
+- `/replay-recover-file` — restore a deleted/lost file
+- `/replay-recover-project` — resurrect an entire `rm -rf`'d project
+- `/replay-analyze` — structured event export for research
 
 ### As a standalone CLI
 
 ```bash
 git clone https://github.com/Lightcone-ZhangYifa/claude-replay-plugin
-alias claude-replay='python3 /path/to/claude-replay-plugin/scripts/replay_engine.py'
+sudo ln -s "$PWD/claude-replay-plugin/scripts/replay_engine.py" /usr/local/bin/claude-replay
+sudo chmod +x /usr/local/bin/claude-replay
 
-claude-replay status                # what's in your session JSONLs
-claude-replay plan                  # preview the proposed commit chain
-claude-replay execute               # build in sandbox, verify byte-equal
-claude-replay execute --apply       # also rewrite real repo HEAD
-claude-replay analyze --format json # structured event export (researcher mode)
+claude-replay --help
 ```
 
 **Requirements**: Python 3.10+, `git`, `bash`. **No external Python packages.** Linux + macOS supported (Windows via WSL).
 
 ---
 
-## Quick start: rescue your repo in 3 commands
-
-```bash
-# 1. See what claude-replay can recover
-$ claude-replay status
-Project: /home/me/myrepo
-Session JSONLs: 103 (6 main + 97 subagent)
-File ops in scope: 1274 (Write: 312, Edit: 731, MultiEdit: 9, Bash: 222)
-
-# 2. Preview the commit chain (uses your docs/*.md as natural boundaries)
-$ claude-replay plan
-Boundaries: 20
-
-  1. [  94 ops, 33 files]  chore(replay): ssh-architecture-audit
-  2. [  18 ops,  7 files]  chore(replay): volume-keys-configurable
-  ...
- 20. [  37 ops,  7 files]  chore(replay): fab-bubble-fix
-
-# 3. Build it (sandbox first; byte-equality check vs working tree)
-$ claude-replay execute --apply
-Sandbox: /tmp/claude-replay-abc123
-Commits: 20  ·  Diff vs working tree: 0 entries
-Real repo HEAD now: 1205576a8d12 (previous tagged claude-replay-backup-1730912345)
-```
-
----
-
-## Boundary strategies
+## Boundary strategies (rescue mode)
 
 | Strategy        | When to use                                           | CLI flag                          |
 |-----------------|-------------------------------------------------------|-----------------------------------|
@@ -188,25 +196,23 @@ Real repo HEAD now: 1205576a8d12 (previous tagged claude-replay-backup-173091234
 | `one-shot`      | Bare-minimum recovery — one big commit                | —                                 |
 | `manual`        | Full control via JSON list of timestamps              | `--boundaries-file plan.json`     |
 
-Mix and match: `--after 2026-05-04T15:19:00` and `--before 2026-05-06T12:00:00` to scope to a specific window.
+Mix and match: `--after 2026-05-04T15:19:00 --before 2026-05-06T12:00:00` to scope to a specific window.
 
 ---
 
 ## Safety
 
-Three guarantees:
-
 1. **The real repo is untouched until you pass `--apply`.** All replay happens in `/tmp/claude-replay-*`.
-2. **`--apply` aborts if the rebuilt chain isn't byte-equal to your working tree** (overrideable with `--allow-drift` for incremental cleanup).
-3. **Your previous HEAD is always tagged** as `claude-replay-backup-<unix-ts>` before any history rewrite. Roll back with `git reset --hard claude-replay-backup-<ts>`.
-
-The sandbox runs with `core.hooksPath=/dev/null` so a slow or failing pre-commit hook can't corrupt the chain mid-replay.
+2. **`--apply` aborts if the rebuilt chain isn't byte-equal to your working tree** (overrideable with `--allow-drift`).
+3. **Your previous HEAD is always tagged** as `claude-replay-backup-<unix-ts>` before any history rewrite.
+4. **The sandbox runs with `core.hooksPath=/dev/null`** so a slow or failing pre-commit hook can't corrupt the chain mid-replay.
+5. **Read-only on Claude's side.** Session JSONLs are never modified.
 
 ---
 
 ## Real-world numbers
 
-This plugin was built to solve exactly this problem in a 165-file working tree spanning **6 Claude Code sessions over 3 days**, including 19 sub-agent invocations.
+Built to solve exactly this problem in a 165-file working tree spanning **6 Claude Code sessions over 3 days**, including 19 sub-agent invocations.
 
 | Metric | Value |
 |---|---|
@@ -217,79 +223,53 @@ This plugin was built to solve exactly this problem in a 165-file working tree s
 | Final byte-divergence vs working tree | **0** files |
 | End-to-end runtime | **23 seconds** |
 
-Result: a clean, reviewable history. The user could `git revert` a single regretted commit while keeping its v1 predecessor intact.
-
----
-
-## For researchers: structured event export
-
-`claude-replay analyze` emits a normalized event log of every tool use Claude made, suitable for downstream analysis. Two formats:
-
-```bash
-claude-replay analyze --format json     # one JSON record per line (JSONL)
-claude-replay analyze --format csv      # flat CSV with sensible columns
-```
-
-Records carry timestamps, session IDs (so sub-agent ops are linkable to their parent), tool names, full inputs, success flags, and truncated result previews. Headers / metadata go to stderr; the data stream goes to stdout, so you can pipe directly into `jq`, `pandas`, `duckdb`:
-
-```bash
-# Fail rate per tool
-claude-replay analyze --format json \
-  | jq -r '[.tool, .success] | @csv' \
-  | sort | uniq -c | sort -rn
-
-# Edit retry pattern: same file edited within 60s after a failed Edit
-claude-replay analyze --format csv | python3 retry_analyzer.py
-
-# Sub-agent delegation graph
-claude-replay analyze --format json --include-tool Task | jq '.input.subagent_type'
-```
-
-See [`docs/researchers.md`](docs/researchers.md) for the full event schema and example analyses.
-
 ---
 
 ## What it does NOT do
 
 - **Does not invent commits Claude didn't make.** The chain is a faithful replay of recorded ops, not a re-summarization of the diff.
 - **Does not modify your session JSONLs.** Read-only on Claude's side.
-- **Does not run your pre-commit hooks during sandbox replay.** A hook failure mid-replay can't corrupt the chain. Hooks run again normally on later real-repo commits.
+- **Does not run your pre-commit hooks during sandbox replay.** A hook failure mid-replay can't corrupt the chain.
 - **Does not push to any remote.** You explicitly do that after reviewing.
-- **Does not work without git.** The repo must be a git repo with at least one commit (the baseline).
+- **Does not work without git.** The repo must be a git repo with at least one commit (the baseline) — except `recover-project`, which can resurrect into an empty target.
+- **Does not recover files Claude only Read but never Wrote/Edited.** No baseline = no recovery for those.
 
 ---
 
 ## FAQ
 
-### Does this work for sub-agents?
-Yes. JSONLs from `subagents/*.jsonl` are merged into the same chronological timeline (since v0.1.0).
+**Does this work for sub-agents?**
+Yes. JSONLs from `subagents/*.jsonl` are merged into the same chronological timeline.
 
-### What if a `sed -i` command in the original session was complex?
-Most patterns replay perfectly. For exotic escapes that don't, the verification diff catches it and you can either add a final `chore: align with working tree` commit or pass `--allow-drift` to apply anyway and patch up.
+**What if a `sed -i` command in the original session was complex?**
+Most patterns replay perfectly because we re-execute the literal `bash -c` command in the sandbox. For exotic cases, the verification diff catches the divergence.
 
-### What if the user manually edited files outside Claude?
-Those edits won't appear in any JSONL, so they show up as a sandbox-vs-working-tree divergence. Pin them into a final alignment commit.
+**What if the user manually edited files outside Claude?**
+Those edits won't appear in any JSONL, so they show up as a sandbox-vs-working-tree divergence. Pin them into a final `chore: align with working tree` commit.
 
-### What if I ran claude-replay itself in the session I want to replay?
-Use `--before <ts>` to cap the replay before your own forensic work began. (Self-replay would otherwise try to re-run claude-replay's own bash scripts inside the sandbox.)
+**What if I ran claude-replay itself in the session I want to replay?**
+Use `--before <ts>` to cap the replay before your own forensic work began.
 
-### Can I undo a `--apply`?
+**Can I undo a `--apply`?**
 Yes: `git reset --hard claude-replay-backup-<unix-ts>` (the tag is created automatically before every history rewrite).
 
-### Why not just use `git reflog`?
-`git reflog` only knows about operations on the .git store (commits, branches, resets). Your forgotten work was never committed in the first place — there's nothing in the reflog to recover. The JSONLs are the only source of truth.
+**Why not just use `git reflog`?**
+`git reflog` only knows about operations on the .git store. Your forgotten work was never committed in the first place — there's nothing in the reflog to recover. The JSONLs are the only source of truth.
 
-### Does this work with project-types other than Android / Kotlin?
+**Does this work with project types other than Android/Kotlin?**
 Yes. The engine is language-agnostic. It just replays bytes; it doesn't parse what's in the files.
 
-### What about Windows?
+**Windows support?**
 Use WSL. The engine relies on `bash` to faithfully re-run captured Bash ops; native Windows shells have different semantics.
+
+**My session JSONLs contain secrets / private content. Is sharing the analyze output safe?**
+By default no — `analyze` emits the full input verbatim. Strip `input.content` / `input.old_string` / `input.new_string` and absolute paths before publishing. See [`docs/researchers.md`](docs/researchers.md) for the privacy checklist.
 
 ---
 
 ## Contributing
 
-PRs welcome. Please run `python3 -m pytest tests/ -v` first. New boundary strategies, better Bash heuristics, additional export formats — all wanted. See [CONTRIBUTING.md](CONTRIBUTING.md).
+PRs welcome. Run `python3 -m pytest tests/ -v` first. New boundary strategies, better Bash heuristics, additional export formats — all wanted. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Star history
 

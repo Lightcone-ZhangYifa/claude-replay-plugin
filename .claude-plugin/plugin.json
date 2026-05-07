@@ -15,6 +15,12 @@
     "commit-history",
     "replay",
     "session-recovery",
-    "ai-audit-trail"
+    "file-recovery",
+    "project-recovery",
+    "disaster-recovery",
+    "ai-audit-trail",
+    "agent-behavior-analysis",
+    "byte-level-replay",
+    "rescue"
   ]
 }

@@ -178,3 +178,157 @@ def test_one_shot_strategy():
     specs = re_.boundaries_one_shot([])
     assert len(specs) == 1
     assert specs[0].until_ts == "9999"
+
+
+def test_recover_file_end_to_end():
+    """Lifeline scenario — one file written then edited; reconstruct from JSONL alone."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        session_dir = tmp / "sessions"
+        out_dir = tmp / "out"
+        target_file = "/abs/repo/src/lost.py"
+        records = [
+            _tool_use("u1", _ts(0), "Write", {"file_path": target_file, "content": "v1\n"}),
+            _tool_result("u1", _ts(1)),
+            _tool_use("u2", _ts(10), "Edit", {
+                "file_path": target_file, "old_string": "v1", "new_string": "v2"}),
+            _tool_result("u2", _ts(11)),
+            _tool_use("u3", _ts(20), "Edit", {
+                "file_path": target_file, "old_string": "v2", "new_string": "v3"}),
+            _tool_result("u3", _ts(21)),
+        ]
+        _make_jsonl(session_dir, "main", records)
+
+        # Use the engine functions directly (mimics CLI)
+        jsonls = re_.find_session_jsonls(session_dir)
+        ops = sorted(
+            [op for op in _collect_ops_for_path(jsonls, target_file)],
+            key=lambda o: o.ts,
+        )
+        assert len(ops) == 3
+
+        # Reconstruct
+        content = ""
+        for o in ops:
+            if o.name == "Write":
+                content = o.payload["content"]
+            elif o.name == "Edit":
+                content = content.replace(o.payload["old_string"], o.payload["new_string"], 1)
+        assert content == "v3\n"
+
+
+def test_recover_file_at_specific_ts():
+    """Recover an intermediate version with --at-ts (mid-history snapshot)."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        session_dir = tmp / "sessions"
+        target_file = "/abs/repo/src/lost.py"
+        records = [
+            _tool_use("u1", _ts(0), "Write", {"file_path": target_file, "content": "v1\n"}),
+            _tool_result("u1", _ts(1)),
+            _tool_use("u2", _ts(10), "Edit", {
+                "file_path": target_file, "old_string": "v1", "new_string": "v2"}),
+            _tool_result("u2", _ts(11)),
+            _tool_use("u3", _ts(20), "Edit", {
+                "file_path": target_file, "old_string": "v2", "new_string": "v3"}),
+            _tool_result("u3", _ts(21)),
+        ]
+        _make_jsonl(session_dir, "main", records)
+
+        # Filter ops with ts <= _ts(15) — should give v2
+        jsonls = re_.find_session_jsonls(session_dir)
+        ops = [
+            op for op in _collect_ops_for_path(jsonls, target_file)
+            if op.ts <= _ts(15)
+        ]
+        ops.sort(key=lambda o: o.ts)
+        content = ""
+        for o in ops:
+            if o.name == "Write":
+                content = o.payload["content"]
+            elif o.name == "Edit":
+                content = content.replace(o.payload["old_string"], o.payload["new_string"], 1)
+        assert content == "v2\n"
+
+
+def test_recover_project_end_to_end():
+    """Project resurrection — multiple files reconstructed into a fresh tree."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        session_dir = tmp / "sessions"
+        out_dir = tmp / "out"
+        records = [
+            _tool_use("u1", _ts(0), "Write", {
+                "file_path": "/abs/myrepo/src/a.py", "content": "a()\n"}),
+            _tool_result("u1", _ts(1)),
+            _tool_use("u2", _ts(10), "Write", {
+                "file_path": "/abs/myrepo/src/b.py", "content": "b()\n"}),
+            _tool_result("u2", _ts(11)),
+            _tool_use("u3", _ts(20), "Write", {
+                "file_path": "/abs/myrepo/README.md", "content": "# myrepo\n"}),
+            _tool_result("u3", _ts(21)),
+            _tool_use("u4", _ts(30), "Edit", {
+                "file_path": "/abs/myrepo/src/a.py",
+                "old_string": "a()", "new_string": "a() + 1"}),
+            _tool_result("u4", _ts(31)),
+        ]
+        _make_jsonl(session_dir, "main", records)
+
+        jsonls = re_.find_session_jsonls(session_dir)
+        # _collect_ops collects per-file
+        from collections import defaultdict
+        ops_per_file = defaultdict(list)
+        for op in _collect_all_ops(jsonls):
+            if op.file_path and op.file_path.startswith("/abs/myrepo/"):
+                ops_per_file[op.file_path].append(op)
+
+        assert set(ops_per_file.keys()) == {
+            "/abs/myrepo/src/a.py", "/abs/myrepo/src/b.py", "/abs/myrepo/README.md"}
+
+        # Reconstruct each
+        out_dir.mkdir()
+        for orig_path, ops in ops_per_file.items():
+            ops.sort(key=lambda o: o.ts)
+            content = ""
+            for o in ops:
+                if o.name == "Write":
+                    content = o.payload["content"]
+                elif o.name == "Edit":
+                    content = content.replace(
+                        o.payload["old_string"], o.payload["new_string"], 1)
+            rel = Path(orig_path).relative_to("/abs/myrepo")
+            dest = out_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
+
+        assert (out_dir / "src/a.py").read_text() == "a() + 1\n"
+        assert (out_dir / "src/b.py").read_text() == "b()\n"
+        assert (out_dir / "README.md").read_text() == "# myrepo\n"
+
+
+def _collect_ops_for_path(jsonls, target_path: str):
+    """Helper: read JSONLs and emit ops on target_path only."""
+    for op in _collect_all_ops(jsonls):
+        if op.file_path == target_path:
+            yield op
+
+
+def _collect_all_ops(jsonls):
+    """Helper: read JSONLs and emit all file-touching Ops (no repo-root filter)."""
+    for path in jsonls:
+        sid = path.stem
+        with path.open() as fp:
+            for line in fp:
+                rec = json.loads(line)
+                ts = rec.get("timestamp", "")
+                msg = rec.get("message", {})
+                if msg.get("role") != "assistant":
+                    continue
+                for block in msg.get("content", []):
+                    if block.get("type") != "tool_use":
+                        continue
+                    name = block.get("name")
+                    if name not in ("Write", "Edit", "MultiEdit"):
+                        continue
+                    yield re_.Op(ts=ts, sid=sid, name=name,
+                                  payload=block.get("input") or {})

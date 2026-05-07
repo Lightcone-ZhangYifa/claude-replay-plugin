@@ -489,6 +489,390 @@ def apply_chain_to_real_repo(real_repo: Path, sandbox: Path, branch: str,
 # CLI
 # --------------------------------------------------------------------------- #
 
+def cmd_recover_file(args: argparse.Namespace) -> int:
+    """Reconstruct a single file's content from its session history.
+
+    Use case: Claude (or you) deleted an important file. As long as you
+    originally created/edited it through Claude, every byte is recoverable
+    from the session JSONLs.
+
+    Strategy: find all Write/Edit/MultiEdit ops on the target path across
+    every session JSONL (including subagents), apply them in chronological
+    order starting from empty. The result is the file's final content
+    (or its content at --at-ts).
+    """
+    target = Path(args.file).resolve() if args.file else None
+    if not target and not args.path_match:
+        print("ERROR: --file or --path-match required", file=sys.stderr)
+        return 2
+
+    # Find session dir(s)
+    session_dirs: list[Path] = []
+    if args.session_dir:
+        session_dirs.append(Path(args.session_dir))
+    elif args.project_name:
+        session_dirs.append(Path.home() / ".claude" / "projects" / args.project_name)
+    else:
+        # Auto-discover: scan all project dirs and pick those that touch this file
+        root = Path.home() / ".claude" / "projects"
+        if not root.exists():
+            print(f"ERROR: {root} does not exist", file=sys.stderr)
+            return 2
+        for d in root.iterdir():
+            if d.is_dir():
+                session_dirs.append(d)
+
+    # Collect file ops on target across all sessions
+    matching_path_re = re.compile(args.path_match) if args.path_match else None
+
+    ops_per_file: dict[str, list[Op]] = defaultdict(list)
+    found_paths: set[str] = set()
+
+    for sd in session_dirs:
+        jsonls = find_session_jsonls(sd)
+        for path in jsonls:
+            sid = path.stem
+            try:
+                with path.open(encoding="utf-8") as fp:
+                    for line in fp:
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        ts = rec.get("timestamp", "")
+                        if args.at_ts and ts > args.at_ts:
+                            continue
+                        msg = rec.get("message") or {}
+                        if msg.get("role") != "assistant":
+                            continue
+                        content = msg.get("content", [])
+                        if not isinstance(content, list):
+                            continue
+                        for block in content:
+                            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                                continue
+                            name = block.get("name")
+                            if name not in ("Write", "Edit", "MultiEdit"):
+                                continue
+                            inp = block.get("input") or {}
+                            fp_ = inp.get("file_path", "")
+                            # Match by exact path or path-match regex
+                            matches = False
+                            if target and fp_ == str(target):
+                                matches = True
+                            elif matching_path_re and matching_path_re.search(fp_):
+                                matches = True
+                            if not matches:
+                                continue
+                            found_paths.add(fp_)
+                            ops_per_file[fp_].append(
+                                Op(ts=ts, sid=sid, name=name, payload=inp)
+                            )
+            except OSError:
+                continue
+
+    if not found_paths:
+        suffix = ""
+        if target:
+            suffix = f"\nLooked for: {target}"
+        elif args.path_match:
+            suffix = f"\nPattern: {args.path_match}"
+        print(f"No file ops found.{suffix}", file=sys.stderr)
+        print(f"Searched {len(session_dirs)} session dir(s).", file=sys.stderr)
+        return 2
+
+    # If --list-versions, just show the timeline
+    if args.list_versions:
+        print(f"# Found {len(found_paths)} file(s) with ops:", file=sys.stderr)
+        for path in sorted(found_paths):
+            ops = sorted(ops_per_file[path], key=lambda o: o.ts)
+            print(f"\n=== {path} ({len(ops)} ops) ===")
+            for o in ops:
+                detail = ""
+                if o.name == "Write":
+                    detail = f"(content: {len(o.payload.get('content', ''))} bytes)"
+                elif o.name == "Edit":
+                    old_len = len(o.payload.get("old_string", ""))
+                    detail = f"(replace {old_len} chars)"
+                elif o.name == "MultiEdit":
+                    detail = f"({len(o.payload.get('edits', []))} edits)"
+                print(f"  {o.ts[:19]}  {o.name:10s}  {detail}")
+        return 0
+
+    # Reconstruct each file
+    out_root = Path(args.output_dir) if args.output_dir else None
+    if out_root:
+        out_root.mkdir(parents=True, exist_ok=True)
+
+    recovered = 0
+    skipped = 0
+    for path in sorted(found_paths):
+        ops = sorted(ops_per_file[path], key=lambda o: o.ts)
+        # Need a baseline. If first op is Write, baseline is "" (Write supplies it).
+        # If first op is Edit, we have no baseline — skip with warning.
+        if ops[0].name != "Write":
+            print(f"SKIP {path}: no leading Write — cannot reconstruct without baseline "
+                  f"(first op was {ops[0].name})", file=sys.stderr)
+            skipped += 1
+            continue
+        content = ""
+        for o in ops:
+            try:
+                if o.name == "Write":
+                    content = o.payload.get("content", "")
+                elif o.name == "Edit":
+                    old = o.payload.get("old_string", "")
+                    new = o.payload.get("new_string", "")
+                    if o.payload.get("replace_all", False):
+                        content = content.replace(old, new)
+                    else:
+                        idx = content.find(old)
+                        if idx < 0:
+                            print(f"WARN {path} @ {o.ts[:19]}: Edit old_string not found, skipping",
+                                  file=sys.stderr)
+                            continue
+                        content = content[:idx] + new + content[idx + len(old):]
+                elif o.name == "MultiEdit":
+                    for e in o.payload.get("edits", []):
+                        old = e.get("old_string", "")
+                        new = e.get("new_string", "")
+                        if e.get("replace_all", False):
+                            content = content.replace(old, new)
+                        else:
+                            idx = content.find(old)
+                            if idx < 0:
+                                continue
+                            content = content[:idx] + new + content[idx + len(old):]
+            except Exception as ex:
+                print(f"WARN {path} @ {o.ts[:19]}: {ex}", file=sys.stderr)
+
+        if out_root:
+            # Preserve the original directory structure under out_root
+            rel = Path(path).name if not args.preserve_paths else Path(path).relative_to("/")
+            dest = out_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
+            print(f"RECOVERED {dest}  ({len(content)} bytes from {len(ops)} ops)")
+        else:
+            # stdout
+            if len(found_paths) > 1:
+                print(f"\n# === {path} ({len(content)} bytes from {len(ops)} ops) ===")
+            sys.stdout.write(content)
+        recovered += 1
+
+    print(f"\n# Recovered {recovered} file(s), skipped {skipped}", file=sys.stderr)
+    return 0
+
+
+def cmd_recover_project(args: argparse.Namespace) -> int:
+    """Reconstruct an entire project from Claude session JSONLs.
+
+    Use case: you accidentally rm -rf'd your project. As long as it was
+    built primarily through Claude, every file with a leading Write op
+    can be reconstructed.
+
+    Output is a new directory with all recovered files placed at their
+    original absolute paths (rebased under --output-dir). If --git-init
+    is set, also produces a commit chain via the standard execute pipeline.
+    """
+    out = Path(args.output_dir).resolve()
+    if out.exists() and not args.force:
+        print(f"ERROR: {out} already exists; pass --force to overwrite", file=sys.stderr)
+        return 2
+
+    # Discover sessions for the original project
+    if args.project_name:
+        session_dir = Path.home() / ".claude" / "projects" / args.project_name
+    elif args.session_dir:
+        session_dir = Path(args.session_dir)
+    else:
+        # Try auto: derive from out's name (assume user names the recovery dir
+        # similarly to the original project, common pattern)
+        candidates = [
+            Path.home() / ".claude" / "projects" / f"-{out.name}",
+        ]
+        for d in (Path.home() / ".claude" / "projects").iterdir() if (Path.home() / ".claude" / "projects").exists() else []:
+            if d.is_dir() and out.name in d.name:
+                candidates.append(d)
+        session_dir = next((c for c in candidates if c.exists()), None)
+        if not session_dir:
+            print(f"ERROR: cannot auto-discover session dir; pass --project-name or --session-dir",
+                  file=sys.stderr)
+            print(f"Available projects:", file=sys.stderr)
+            root = Path.home() / ".claude" / "projects"
+            if root.exists():
+                for d in sorted(root.iterdir()):
+                    print(f"  {d.name}", file=sys.stderr)
+            return 2
+
+    print(f"Session dir: {session_dir}")
+    jsonls = find_session_jsonls(session_dir)
+    if not jsonls:
+        print(f"ERROR: no JSONLs in {session_dir}", file=sys.stderr)
+        return 2
+
+    # Determine the original project root from the first file_path we see
+    original_root = args.original_root
+    if not original_root:
+        original_root = _infer_original_root(jsonls)
+        if not original_root:
+            print("ERROR: cannot infer original project root; pass --original-root /home/.../proj",
+                  file=sys.stderr)
+            return 2
+    original_root = original_root.rstrip("/")
+    print(f"Original project root (inferred): {original_root}")
+
+    # Gather all ops on files under original_root
+    ops_per_file: dict[str, list[Op]] = defaultdict(list)
+    for jpath in jsonls:
+        sid = jpath.stem
+        try:
+            with jpath.open(encoding="utf-8") as fp:
+                for line in fp:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = rec.get("timestamp", "")
+                    if args.at_ts and ts > args.at_ts:
+                        continue
+                    msg = rec.get("message") or {}
+                    if msg.get("role") != "assistant":
+                        continue
+                    content = msg.get("content", [])
+                    if not isinstance(content, list):
+                        continue
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_use":
+                            continue
+                        name = block.get("name")
+                        if name not in ("Write", "Edit", "MultiEdit"):
+                            continue
+                        inp = block.get("input") or {}
+                        fp_ = inp.get("file_path", "")
+                        if not fp_.startswith(original_root + "/"):
+                            continue
+                        ops_per_file[fp_].append(Op(ts=ts, sid=sid, name=name, payload=inp))
+        except OSError:
+            continue
+
+    print(f"Files with recoverable ops: {len(ops_per_file)}")
+    if not ops_per_file:
+        print("Nothing to recover.", file=sys.stderr)
+        return 2
+
+    # Materialize each file into out
+    if out.exists() and args.force:
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+
+    recovered = 0
+    skipped = 0
+    for orig_path, ops in sorted(ops_per_file.items()):
+        ops_sorted = sorted(ops, key=lambda o: o.ts)
+        if ops_sorted[0].name != "Write":
+            print(f"SKIP {orig_path}: no leading Write", file=sys.stderr)
+            skipped += 1
+            continue
+        content = ""
+        for o in ops_sorted:
+            try:
+                if o.name == "Write":
+                    content = o.payload.get("content", "")
+                elif o.name == "Edit":
+                    old = o.payload.get("old_string", "")
+                    new = o.payload.get("new_string", "")
+                    if o.payload.get("replace_all", False):
+                        content = content.replace(old, new)
+                    else:
+                        idx = content.find(old)
+                        if idx < 0:
+                            continue
+                        content = content[:idx] + new + content[idx + len(old):]
+                elif o.name == "MultiEdit":
+                    for e in o.payload.get("edits", []):
+                        old = e.get("old_string", "")
+                        new = e.get("new_string", "")
+                        if e.get("replace_all", False):
+                            content = content.replace(old, new)
+                        else:
+                            idx = content.find(old)
+                            if idx < 0:
+                                continue
+                            content = content[:idx] + new + content[idx + len(old):]
+            except Exception:
+                pass
+        rel = Path(orig_path).relative_to(original_root)
+        dest = out / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+        recovered += 1
+
+    print(f"\nRecovered {recovered} files into {out}")
+    print(f"Skipped (no Write op): {skipped}")
+
+    if args.git_init:
+        subprocess.run(["git", "-C", str(out), "init", "-q", "-b", "main"], check=True)
+        for key, fallback in (("user.name", "claude-replay"),
+                                 ("user.email", "claude-replay@local")):
+            try:
+                v = subprocess.check_output(["git", "config", "--global", "--get", key],
+                                              stderr=subprocess.DEVNULL).decode().strip()
+            except subprocess.CalledProcessError:
+                v = fallback
+            subprocess.run(["git", "-C", str(out), "config", key, v or fallback], check=True)
+        subprocess.run(["git", "-C", str(out), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(out), "commit", "-q", "-m",
+             f"chore(replay): project recovered from {session_dir.name} JSONLs\n\n"
+             f"Files: {recovered}  Skipped: {skipped}"],
+            check=True,
+        )
+        print(f"Initialized git repo at {out} with one snapshot commit.")
+        print(f"For per-feature commits, run: claude-replay execute --repo {out} ...")
+
+    return 0
+
+
+def _infer_original_root(jsonls: list[Path]) -> Optional[str]:
+    """Find the longest common prefix of file_paths across the sessions."""
+    paths: list[str] = []
+    for jp in jsonls[:5]:  # sample
+        try:
+            with jp.open(encoding="utf-8") as fp:
+                for line in fp:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = rec.get("message") or {}
+                    if msg.get("role") != "assistant":
+                        continue
+                    content = msg.get("content", [])
+                    if not isinstance(content, list):
+                        continue
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_use":
+                            continue
+                        if block.get("name") not in ("Write", "Edit", "MultiEdit"):
+                            continue
+                        fp_ = (block.get("input") or {}).get("file_path", "")
+                        if fp_.startswith("/"):
+                            paths.append(fp_)
+                            if len(paths) > 100:
+                                break
+                    if len(paths) > 100:
+                        break
+        except OSError:
+            continue
+        if len(paths) > 100:
+            break
+    if not paths:
+        return None
+    common = os.path.commonpath(paths)
+    return common if common.count("/") >= 2 else None
+
+
 def cmd_analyze(args: argparse.Namespace) -> int:
     """Emit a structured event log of every tool use Claude made.
 
@@ -836,6 +1220,42 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_exec.add_argument("--verbose", "-v", action="store_true",
                          help="print per-commit progress to stderr")
 
+    p_recover_file = sub.add_parser("recover-file",
+                                       help="reconstruct a single file from its session-history (lifeline mode)")
+    p_recover_file.add_argument("--file", default=None,
+                                  help="absolute path of the file to recover")
+    p_recover_file.add_argument("--path-match", default=None,
+                                  help="regex matching one or more file paths (alt to --file)")
+    p_recover_file.add_argument("--session-dir", default=None,
+                                  help="explicit session dir (default: auto-discover all)")
+    p_recover_file.add_argument("--project-name", default=None,
+                                  help="encoded project name under ~/.claude/projects/ (e.g. -home-me-myrepo)")
+    p_recover_file.add_argument("--at-ts", default=None,
+                                  help="recover state as of this timestamp (default: latest)")
+    p_recover_file.add_argument("--list-versions", action="store_true",
+                                  help="just list the timeline of ops on the file, don't reconstruct")
+    p_recover_file.add_argument("--output-dir", default=None,
+                                  help="write recovered files here (default: stdout)")
+    p_recover_file.add_argument("--preserve-paths", action="store_true",
+                                  help="under --output-dir, preserve full original paths (default: basename only)")
+
+    p_recover_proj = sub.add_parser("recover-project",
+                                      help="reconstruct an entire project from session JSONLs (back-from-the-dead mode)")
+    p_recover_proj.add_argument("--output-dir", required=True,
+                                  help="where to materialize the recovered project (must be empty or use --force)")
+    p_recover_proj.add_argument("--session-dir", default=None,
+                                  help="explicit session dir (default: auto from output-dir name or --project-name)")
+    p_recover_proj.add_argument("--project-name", default=None,
+                                  help="encoded project name under ~/.claude/projects/ (e.g. -home-me-myrepo)")
+    p_recover_proj.add_argument("--original-root", default=None,
+                                  help="original project absolute path (default: auto-infer from session JSONLs)")
+    p_recover_proj.add_argument("--at-ts", default=None,
+                                  help="recover state as of this timestamp")
+    p_recover_proj.add_argument("--git-init", action="store_true",
+                                  help="git init the recovered project + one snapshot commit")
+    p_recover_proj.add_argument("--force", action="store_true",
+                                  help="overwrite output-dir if it exists")
+
     p_analyze = sub.add_parser("analyze", parents=[common],
                                  help="emit structured event log of every tool use")
     p_analyze.add_argument("--format", default="json",
@@ -851,6 +1271,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_plan.set_defaults(func=cmd_plan)
     p_exec.set_defaults(func=cmd_execute)
     p_analyze.set_defaults(func=cmd_analyze)
+    p_recover_file.set_defaults(func=cmd_recover_file)
+    p_recover_proj.set_defaults(func=cmd_recover_project)
 
     args = p.parse_args(argv)
     return args.func(args)

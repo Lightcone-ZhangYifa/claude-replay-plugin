@@ -1,6 +1,6 @@
 ---
 name: claude-replay
-description: Reconstruct lost git commits from Claude Code session history. Use this when the user has accumulated changes in the working tree across multiple Claude sessions without committing — the session JSONLs in ~/.claude/projects/ contain every Edit/Write/Bash op and can be byte-replayed into a clean commit chain. Use when the user mentions "lost commits", "uncommitted work", "session history", "forgot to commit", "rebuild git history from Claude", or asks to convert chaotic working-tree changes into discrete semantic commits.
+description: Recover lost work from Claude Code session JSONLs by byte-replaying every Edit/Write/Bash tool call. Use for FOUR scenarios — (1) RESCUE: user forgot to commit and has hundreds of uncommitted files across many Claude sessions; reconstruct a clean commit chain. (2) LIFELINE: user wants to recover a specific deleted/lost file that was originally created or edited via Claude. (3) BACK-FROM-DEAD: user accidentally rm -rf'd an entire project that was built through Claude; resurrect the file tree from JSONLs alone. (4) RESEARCH: user studies AI-agent behavior (tool retry patterns, sub-agent delegation, error recovery) and needs structured event-log export. Trigger on phrases like "forgot to commit", "uncommitted work", "lost commits", "rebuild git history", "deleted file", "rm -rf", "lost project", "resurrect project", "agent behavior analysis", "Claude tool-call log", "byte-level replay", "session JSONL".
 ---
 
 # claude-replay
@@ -26,13 +26,17 @@ Claude Code persists every assistant turn — including every tool call's input 
 
 Replay = clone the repo into a sandbox, checkout a baseline commit, and replay every op in chronological timestamp order. Because each op is deterministic against the state it was originally applied to, replaying them in the same order against the same baseline reproduces the exact same byte sequence.
 
-## Three slash commands
+## Slash commands by scenario
 
-- `/replay-status` — what's in the session JSONLs (no side effects)
-- `/replay-plan` — preview the proposed commit chain (no side effects)
-- `/replay-execute` — build the chain in a sandbox; `--apply` to rewrite real repo HEAD
-
-For a guided end-to-end flow, use `/replay`.
+| Scenario | Command | Purpose |
+|---|---|---|
+| Rescue (forgot to commit) | `/replay` | Guided end-to-end |
+| Rescue inspection | `/replay-status` | Read-only — what's in the JSONLs |
+| Rescue planning | `/replay-plan` | Preview the proposed commit chain |
+| Rescue execution | `/replay-execute [--apply]` | Build sandbox; optionally rewrite HEAD |
+| Lifeline (deleted file) | `/replay-recover-file` | Reconstruct one file from history |
+| Back-from-dead (lost project) | `/replay-recover-project` | Resurrect a whole project tree |
+| Research (event log export) | `/replay-analyze` | JSONL/CSV/stats over every tool call |
 
 ## Boundary strategies
 
