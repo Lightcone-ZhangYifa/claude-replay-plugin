@@ -76,7 +76,7 @@ def test_glob_to_regex():
 
 def test_end_to_end_doc_files_strategy():
     with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
+        tmp = Path(td).resolve()  # macOS: /var → /private/var symlink
         repo = _init_repo(tmp)
 
         # Fake the session-dir lookup by patching project_session_dir
